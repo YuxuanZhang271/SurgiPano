@@ -1,0 +1,6 @@
+[submodule "third_party/tapnet"]
+	path = third_party/tapnet
+	url = https://github.com/google-deepmind/tapnet.git
+[submodule "third_party/Stitch-seg"]
+	path = third_party/Stitch-seg
+	url = https://github.com/JmeesInc/Stitch-seg.git
