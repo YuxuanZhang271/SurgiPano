@@ -391,7 +391,7 @@ def parse_args():
                         help="Path to a grayscale mask PNG (nonzero = available).")
     parser.add_argument("--mask_margin", type=int, default=15,
                         help="Erode the mask by this many pixels before sampling.")
-    parser.add_argument("--min_brightness", type=float, default=0.0,
+    parser.add_argument("--min_brightness", type=float, default=40.0,
                         help="Only sample points where local brightness > value.")
     parser.add_argument("--output", default=None,
                         help="Optional path to write an annotated output mp4.")

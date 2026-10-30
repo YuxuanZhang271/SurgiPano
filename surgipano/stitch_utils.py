@@ -25,6 +25,9 @@ import os
 import sys
 from pathlib import Path
 
+import contextlib
+import io
+
 # ---- package-relative paths ----
 _HERE = Path(__file__).resolve().parent                       # SurgiPano/surgipano/
 _ROOT = _HERE.parent                                          # SurgiPano/
@@ -255,6 +258,22 @@ def scope_contour(ellipse_mask: torch.Tensor | None):
     return biggest.reshape(-1, 2).astype(np.float32)
 
 
+@contextlib.contextmanager
+def _suppress_stdout():
+    """Temporarily redirect sys.stdout to a StringIO.
+
+    TAPIR's per-frame diagnostics use print() and would otherwise flood the
+    progress bar. Matches the helper of the same name in
+    ``surgipano/tapir_standalone.py``.
+    """
+    old_stdout = sys.stdout
+    sys.stdout = io.StringIO()
+    try:
+        yield
+    finally:
+        sys.stdout = old_stdout
+
+        
 # ============================================================================
 # Video writer
 # ============================================================================
