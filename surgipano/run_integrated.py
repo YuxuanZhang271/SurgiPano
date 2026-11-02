@@ -1,384 +1,153 @@
-# surgipano/run_integrated.py
-from __future__ import annotations
+"""Continuous TAPIR-guided geometric registration, no neural-network training.
 
-import argparse, os, sys, time, warnings
+Stitch provides a relative geometric candidate; TAPIR provides temporal point
+correspondences. Robust refinement selects a current->previous transform and
+builds an independent fused panorama. Does NOT change Stitch internal canvas.
+"""
+import argparse
+import time
 from pathlib import Path
-
-# ---- path bootstrap: works for `python -m surgipano.run_integrated`
-#      and `python surgipano/run_integrated.py`. ----
-_HERE = Path(__file__).resolve().parent
-_ROOT = _HERE.parent
-_THIRD = _ROOT / "third_party"
-for p in (_ROOT, _THIRD, _THIRD / "tapnet", _THIRD / "Stitch-seg"):
-    if str(p) not in sys.path:
-        sys.path.insert(0, str(p))
-
-os.environ.setdefault("CUDA_DEVICE_ORDER", "PCI_BUS_ID")
-os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
-
 import cv2
+from tqdm.auto import tqdm
 import numpy as np
-import torch
-import tree
-from tqdm import tqdm
-
-from stitch_seg import StitchInferencer
-from stitch_seg.config import apply_stitch_defaults
-from tapnet.torch import tapir_model
-from surgipano.masking_setup import setup_masking
-from surgipano import stitch_utils as sd
+from scipy.optimize import least_squares
+from common import (expected_frame_count, add_arguments, frame_iterator, make_stitch, image_numpy, normalize_h,
+                    estimate_h, transform, valid_h, canvas_init, compose, mask_for_frame,
+                    stitch_error, write_metrics, save_rgb)
+from tapir_adapter import TapirTracker
+from video_preview import AlignmentVideo
+from mask_utils import ScopeMask
 
 
-# ============================================================================
-# TAPIR wrapper
-# ============================================================================
-class TapirTracker:
-    """Causal TAPIR tracker over an arbitrary frame stream."""
-
-    def __init__(self, checkpoint: str, device: torch.device,
-                 grid_spacing: int = 64, model_hw: int = 256,
-                 visibility: str = "occlusion"):
-        self.device = device
-        self.grid_spacing = grid_spacing
-        self.model_hw = model_hw
-        self.visibility = visibility
-        self.model = tapir_model.TAPIR(pyramid_level=1, use_casual_conv=True)
-        self.model.load_state_dict(torch.load(checkpoint, map_location=device))
-        self.model = self.model.to(device).eval()
-        torch.set_grad_enabled(False)
-        self.query_features = None
-        self.causal_state = None
-        self.grid_points = None
-        self.scale_x = self.scale_y = 1.0
-        self.frame_shape = None
-
-    def _to_model_frame(self, frame: np.ndarray) -> np.ndarray:
-        if self.model_hw and frame.shape[0] != self.model_hw:
-            return cv2.resize(frame, (self.model_hw, self.model_hw),
-                              interpolation=cv2.INTER_AREA)
-        return frame
-
-    def _preprocess(self, frames: np.ndarray) -> torch.Tensor:
-        t = torch.from_numpy(frames).float()
-        return (t / 255.0 * 2 - 1).to(self.device)
-
-    def anchor(self, frame: np.ndarray, mask_eroded: np.ndarray | None = None):
-        self.frame_shape = frame.shape[:2]
-        h, w = self.frame_shape
-        self.scale_y = self.model_hw / h
-        self.scale_x = self.model_hw / w
-
-        pts = []
-        y = self.grid_spacing / 2.0
-        while y < h:
-            x = self.grid_spacing / 2.0
-            while x < w:
-                yi, xi = int(y), int(x)
-                if mask_eroded is None or mask_eroded[yi, xi] > 127:
-                    pts.append((0.0, float(y), float(x)))
-                x += self.grid_spacing
-            y += self.grid_spacing
-        if not pts:
-            raise RuntimeError("TAPIR anchor produced no points.")
-        self.grid_points = pts
-
-        qp = np.array(pts, dtype=np.float32)
-        qp[:, 1] *= self.scale_y
-        qp[:, 2] *= self.scale_x
-        qp_t = torch.from_numpy(qp).to(self.device)
-
-        anchor_t = self._preprocess(self._to_model_frame(frame))[None, None]
-        with sd._suppress_stdout():
-            self.query_features = self.model.get_query_features(
-                anchor_t, is_training=False, query_points=qp_t[None],
-                feature_grids=self.model.get_feature_grids(
-                    anchor_t, is_training=False))
-        self.causal_state = self.model.construct_initial_causal_state(
-            len(pts), len(self.query_features.resolutions) - 1)
-        self.causal_state = tree.map_structure(
-            lambda x: x.to(self.device), self.causal_state)
-        return pts
-
-    def step(self, frame: np.ndarray):
-        if self.query_features is None:
-            raise RuntimeError("Call .anchor(frame) before .step(frame).")
-        ft = self._preprocess(self._to_model_frame(frame))[None, None]
-        with sd._suppress_stdout():
-            traj = self.model.estimate_trajectories(
-                ft.shape[-3:-1], is_training=False,
-                feature_grids=self.model.get_feature_grids(ft, is_training=False),
-                query_features=self.query_features,
-                query_points_in_video=None, query_chunk_size=64,
-                causal_context=self.causal_state, get_causal_context=True)
-        self.causal_state = traj["causal_context"]
-        tracks = traj["tracks"][-1].cpu().numpy()
-        occ    = traj["occlusion"][-1].cpu().numpy()
-        unc    = traj["expected_dist"][-1].cpu().numpy()
-
-        xy = tracks[0, :, 0, :].copy()
-        xy[:, 0] /= self.scale_x
-        xy[:, 1] /= self.scale_y
-        if self.visibility == "all":
-            vis = np.ones(len(xy), bool)
-        elif self.visibility == "occlusion":
-            vis = (1 - 1/(1+np.exp(-occ[0, :, 0]))) > 0.5
-        else:
-            vis = ((1 - 1/(1+np.exp(-occ[0, :, 0]))) *
-                   (1 - 1/(1+np.exp(-unc[0, :, 0])))) > 0.5
-        ref = np.array([[p[2], p[1]] for p in self.grid_points])
-        diag = np.hypot(*self.frame_shape)
-        keep = np.linalg.norm(xy - ref, axis=1) < 0.4 * diag
-        return xy[keep & vis], keep & vis
+def refine_h(H_stitch, H_tapir, prev_pts, curr_pts, w, h, stitch_weight=0.25):
+    """Fit current->previous homography to TAPIR tracks plus soft Stitch prior."""
+    if H_tapir is None: return H_stitch, 'stitch'
+    if H_stitch is None: return H_tapir, 'tapir'
+    # RANSAC TAPIR inliers prevent gross outliers dominating refinement.
+    errs = np.linalg.norm(transform(H_tapir, curr_pts)-prev_pts, axis=1)
+    ok = errs < 4.5
+    if ok.sum() < 4: return H_stitch, 'stitch'
+    src, dst = curr_pts[ok], prev_pts[ok]
+    anchors = np.float32([[0,0],[w/2,0],[w,0],[0,h/2],[w/2,h/2],[w,h/2],[0,h],[w/2,h],[w,h]])
+    stitch_targets = transform(H_stitch, anchors)
+    def encode(H): return np.array([H[0,0],H[0,1],H[0,2],H[1,0],H[1,1],H[1,2],H[2,0],H[2,1]])
+    def decode(x): return np.array([[x[0],x[1],x[2]],[x[3],x[4],x[5]],[x[6],x[7],1.0]])
+    def residual(x):
+        H = decode(x)
+        try:
+            r_track = (transform(H, src)-dst).ravel()
+            r_stitch = (transform(H, anchors)-stitch_targets).ravel()
+            return np.r_[r_track, np.sqrt(stitch_weight)*r_stitch]
+        except cv2.error: return np.full(2*len(src)+2*len(anchors), 1e5)
+    result = least_squares(residual, encode(H_tapir), loss='soft_l1', f_scale=3,
+                           max_nfev=35)
+    H = normalize_h(decode(result.x))
+    return (H, 'fused') if valid_h(H, w, h) else (H_tapir, 'tapir')
 
 
-# ============================================================================
-# Helpers
-# ============================================================================
-def _parse_ids(s: str | None) -> list[int] | None:
-    return [int(v) for v in s.split(",")] if s else None
-
-
-# ============================================================================
-# Main loop
-# ============================================================================
 def main():
-    ap = argparse.ArgumentParser(
-        description="SurgiPano: Stitch-seg panorama with optional TAPIR hints "
-                    "and YOLO tool/port masking.")
-    ap.add_argument("--video", required=True)
-    ap.add_argument("--scope-mask", default=None)
-    ap.add_argument("--output-dir", default=str(_ROOT / "data" / "output"))
-    # ---- TAPIR ----
-    ap.add_argument("--enable_tapir", type=int, choices=[0, 1], default=0,
-                    help="0 = Stitch-seg only; 1 = run TAPIR hints alongside.")
-    ap.add_argument("--tapir_checkpoint",
-                    default=str(_THIRD / "tapnet" / "checkpoints" /
-                                "causal_bootstapir_checkpoint.pt"))
-    ap.add_argument("--tapir_grid_spacing", type=int, default=64)
-    ap.add_argument("--tapir_model_hw", type=int, default=256)
-    ap.add_argument("--tapir_visibility",
-                    choices=["full", "occlusion", "all"], default="occlusion")
-    ap.add_argument("--tapir_anchor_every", type=int, default=300,
-                    help="Re-anchor TAPIR every N frames (0 = never).")
-    ap.add_argument("--tapir_disagree_px", type=float, default=25.0)
-    ap.add_argument("--tapir_reset_on_static", type=int, default=0)
-    # ---- YOLO segmentation ----
-    ap.add_argument("--yolo_tool", default=None,
-                    help="YOLO-seg weights for tool masking (None -> zero stub).")
-    ap.add_argument("--yolo_port", default=None,
-                    help="YOLO-seg weights for port masking (None -> zero stub).")
-    ap.add_argument("--yolo_tool_classes", default=None,
-                    help="Comma-separated class IDs kept from --yolo_tool.")
-    ap.add_argument("--yolo_port_classes", default=None,
-                    help="Comma-separated class IDs kept from --yolo_port.")
-    ap.add_argument("--yolo_conf", type=float, default=0.25)
-    # ---- stitcher options ----
-    ap.add_argument("--width", type=int, default=640)
-    ap.add_argument("--height", type=int, default=480)
-    ap.add_argument("--max_frames", type=int, default=None)
-    ap.add_argument("--no_display", action="store_true")
-    args = ap.parse_args()
-
-    # ---- headless fallback: some opencv builds lack highgui entirely ----
-    if not args.no_display and not sd.gui_available():
-        print("[warn] OpenCV has no GUI backend "
-              "(opencv-python-headless or a build without GTK/Qt). "
-              "Forcing --no_display. Outputs (mp4 / PNG) still written.")
-        args.no_display = True
-
-    warnings.filterwarnings(
-        "ignore", message=".*output size is not a multiple of 8.*")
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    sd.PREVIEW_WIDTH, sd.PREVIEW_HEIGHT = args.width, args.height
-
-    # ---- stitcher config ----
-    cfg = apply_stitch_defaults(sd.DemoCfg())
-
-    # ---- segmentation (YOLO or zero-mask stub) ----
-    mask_info = setup_masking(
-        cfg,
-        yolo_tool_weights=args.yolo_tool,
-        yolo_port_weights=args.yolo_port,
-        yolo_tool_classes=_parse_ids(args.yolo_tool_classes),
-        yolo_port_classes=_parse_ids(args.yolo_port_classes),
-        yolo_conf=args.yolo_conf,
-    )
-    print(f"[info] masking   : tool={mask_info['tool']}, port={mask_info['port']}")
-
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    inferencer = StitchInferencer(None, cfg=cfg)
-
-    # ---- scope mask ----
-    scope_inv = None
-    if args.scope_mask:
-        scope_inv = sd.load_scope_mask(
-            str(Path(args.scope_mask).expanduser()), args.width, args.height)
-        print(f"[info] scope mask : {args.scope_mask}")
-
-    # ---- TAPIR ----
-    tapir = None
-    if args.enable_tapir:
-        print("[info] TAPIR enabled — loading checkpoint …")
-        tapir = TapirTracker(
-            args.tapir_checkpoint, device,
-            grid_spacing=args.tapir_grid_spacing,
-            model_hw=args.tapir_model_hw,
-            visibility=args.tapir_visibility)
-        print(f"[info] TAPIR grid  : {tapir.grid_spacing}px, "
-              f"model {tapir.model_hw}², anchor every {args.tapir_anchor_every}")
-    else:
-        print("[info] TAPIR disabled — running pure Stitch-seg baseline.")
-
-    cap = cv2.VideoCapture(str(Path(args.video).expanduser()))
-    if not cap.isOpened():
-        raise SystemExit(f"[error] cannot open {args.video}")
-    src_fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    if args.max_frames is not None:
-        total = min(total, args.max_frames)
-
-    tag = ("tapir" if tapir else "base") + ("+yolo" if (
-        args.yolo_tool or args.yolo_port) else "")
-    preview = sd.PanoramaVideoWriter(
-        out_dir / f"panorama_preview_{tag}.mp4",
-        (args.width, args.height), fps=src_fps)
-    png_every = max(1, int(round(src_fps * 30)))
-    png_dir = out_dir / "panoramas"
-    png_dir.mkdir(exist_ok=True)
-
-    mask_injected = scope_inv is None
-    scope_pts = None
-    frame_idx = 0
-    tapir_anchor_at = 0
-    n_tapir_frames = 0
-    tapir_total_ms = 0.0
-    pbar = tqdm(total=total, desc=f"Stitching [{tag}]",
-                unit="frame", dynamic_ncols=True)
-
-    try:
-        while True:
-            ok, frame = cap.read()
-            if not ok:
-                break
-            if frame.shape[1] != args.width or frame.shape[0] != args.height:
-                frame = cv2.resize(frame, (args.width, args.height),
-                                   interpolation=cv2.INTER_LINEAR)
-            frame_u = inferencer.preprocess_frame(frame)
-
-            # ---- scope mask injection (once) ----
-            if not mask_injected:
-                rx, ry, rw, rh = [int(v) for v in inferencer.roi]
-                m_crop = scope_inv[ry:ry+rh, rx:rx+rw]
-                if tuple(m_crop.shape) != tuple(frame_u.shape[-2:]):
-                    raise SystemExit(
-                        f"[error] scope crop {m_crop.shape} != frame_u "
-                        f"{tuple(frame_u.shape[-2:])}")
-                inferencer.ellipse_mask = torch.from_numpy(
-                    np.ascontiguousarray(m_crop)).to(cfg.device)[None, None]
-                mask_injected = True
-                scope_pts = sd.scope_contour(inferencer.ellipse_mask)
-
-            # ---- TAPIR branch ----
-            tapir_hint = None
-            if tapir is not None:
-                if tapir.query_features is None or (
-                        args.tapir_anchor_every > 0 and
-                        frame_idx - tapir_anchor_at >= args.tapir_anchor_every):
-                    mask_eroded = None
-                    if scope_inv is not None:
-                        mask_eroded = (1 - scope_inv) * 255
-                    tapir.anchor(frame, mask_eroded)
-                    tapir_anchor_at = frame_idx
-                t0 = time.time()
-                xy, vis = tapir.step(frame)
-                tapir_total_ms += (time.time() - t0) * 1000
-                n_tapir_frames += 1
-                if len(xy) >= 4:
-                    tapir_hint = float(np.median(xy[:, 0]))
-
-            # ---- stitcher step (alignment) ----
-            t_stitch = time.time()
-            inferencer.step_canvas(frame_u)
-            stitch_ms = (time.time() - t_stitch) * 1000
-
-            # ---- optional reset heuristic ----
-            if (tapir is not None and tapir_hint is not None
-                    and args.tapir_reset_on_static):
-                H = inferencer._current_to_canvas_h().to(torch.float32)
-                if torch.isfinite(H).all():
-                    denom = float(H[2, 2])
-                    tx = float(H[0, 2] / denom) if abs(denom) > 1e-9 else 0.0
-                    if abs(tx) > args.tapir_disagree_px and abs(tapir_hint) < 1.0:
-                        print(f"[warn] frame {frame_idx}: homography large "
-                              f"(tx={tx:.1f}) but TAPIR motion ~0 -> reset hint")
-                        inferencer.reset_state(clear_preprocess_state=False)
-
-            # ---- preview / PNG ----
-            canvas_np = sd.to_numpy_image(inferencer.canvas)
-            canvas_bgr = None
-            if canvas_np is not None:
-                canvas_bgr = (cv2.cvtColor(canvas_np, cv2.COLOR_RGB2BGR)
-                              if canvas_np.ndim == 3 and canvas_np.shape[2] == 3
-                              else canvas_np)
-                if sd.DRAW_ROI:
-                    fh, fw = frame_u.shape[-2:]
-                    quad = sd.project_corners_to_canvas(inferencer, fw, fh)
-                    if np.all(np.isfinite(quad)):
-                        canvas_bgr = sd.draw_quad(
-                            canvas_bgr, quad, f"ROI frame {frame_idx}")
-                if sd.DRAW_SCOPE and scope_pts is not None:
-                    canvas_bgr = sd.draw_scope_outline(
-                        canvas_bgr,
-                        sd.project_points_to_canvas(inferencer, scope_pts))
-                if tapir is not None and tapir_hint is not None:
-                    sd._put_label(canvas_bgr,
-                                  f"TAPIR tracks: {n_tapir_frames}",
-                                  (10, canvas_bgr.shape[0] - 20),
-                                  (0, 255, 0))
-                preview.write(canvas_bgr, inferencer.canvas_mask, frame)
-                if frame_idx % png_every == 0:
-                    cv2.imwrite(str(png_dir / f"panorama_{frame_idx:06d}.png"),
-                                canvas_bgr)
-
-            if not args.no_display and canvas_bgr is not None:
-                try:
-                    cv2.imshow("SurgiPano", canvas_bgr)
-                    if cv2.waitKey(1) & 0xFF == 27:
-                        break
-                except cv2.error as exc:
-                    print(f"[warn] cv2.imshow failed ({exc}); "
-                          f"continuing headless.")
-                    args.no_display = True
-
-            frame_idx += 1
-            pbar.update(1)
-            pbar.set_postfix_str(f"stitch {stitch_ms:.1f}ms")
-            if args.max_frames is not None and frame_idx >= args.max_frames:
-                break
-    finally:
-        pbar.close()
-        cap.release()
-        preview.close()
-        if not args.no_display:
+    p = argparse.ArgumentParser()
+    add_arguments(p)
+    p.add_argument('--tapir-checkpoint', required=True)
+    p.add_argument('--tapir-resolution', type=int, default=256)
+    p.add_argument('--tapir-spacing', type=int, default=48)
+    p.add_argument('--tapir-refresh', type=int, default=30)
+    p.add_argument('--ransac-threshold', type=float, default=3.0)
+    p.add_argument('--stitch-weight', type=float, default=0.25)
+    p.add_argument('--max-disagreement', type=float, default=25.0)
+    p.add_argument('--preview-width', type=int, default=1600)
+    p.add_argument('--preview-height', type=int, default=720)
+    p.add_argument('--preview-every', type=int, default=1)
+    p.add_argument('--no-preview', action='store_true')
+    p.add_argument('--mask-margin', type=int, default=12)
+    p.add_argument('--canvas-view', choices=['stitch','fused'], default='stitch',
+                   help='Which panorama to show in alignment_preview.mp4 and panorama_final.png')
+    args = p.parse_args()
+    out = Path(args.output_dir); out.mkdir(parents=True, exist_ok=True)
+    stitch = make_stitch(args)
+    scope = ScopeMask(args.scope_mask, args.width, args.height, args.mask_margin)
+    tracker = TapirTracker(args.tapir_checkpoint, args.device, args.tapir_resolution,
+                           args.tapir_spacing, args.tapir_refresh)
+    canvas = coverage = H_canvas = H_stitch_prev = None
+    rows = []
+    preview = None
+    prev_shape = None
+    total = expected_frame_count(args.video, args.max_frames, args.stride)
+    with tqdm(total=total, desc='Integrated', unit='frame', dynamic_ncols=True, smoothing=0.1) as progress:
+      for i, rgb, fps in frame_iterator(args.video, args.width, args.height, args.max_frames, args.stride):
+            t0 = time.perf_counter()
+            bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+            frame_u = stitch.preprocess_frame(bgr)
+            frame = image_numpy(frame_u)
+            h, w = frame.shape[:2]
+            if prev_shape is not None and prev_shape != (h,w):
+                raise RuntimeError('Stitch preprocessing changed ROI size; a fixed ROI is required')
+            prev_shape = (h,w)
+            valid_mask = scope.crop(stitch, frame.shape)
+            mask = scope.eroded(valid_mask)
+            if args.scope_mask:
+                scope.inject_stitch(stitch, valid_mask, args.device)
+            p_prev, p_curr, ntracks = tracker.update(frame, mask)
+            H_tapir, inliers, tapir_error = estimate_h(p_prev, p_curr, w, h, args.ransac_threshold)
             try:
-                cv2.destroyAllWindows()
-            except cv2.error:
-                pass
+                stitch.step_canvas(frame_u)
+                H_stitch_abs = normalize_h(stitch._current_to_canvas_h())
+            except (RuntimeError, ValueError) as exc:
+                print(f'frame {i}: Stitch failed: {exc}; using TAPIR if possible')
+                H_stitch_abs = None
+            H_stitch_rel = None
+            if H_stitch_prev is not None and H_stitch_abs is not None:
+                try:
+                    H_stitch_rel = normalize_h(np.linalg.inv(H_stitch_prev) @ H_stitch_abs)
+                except np.linalg.LinAlgError: pass
+            # Relative Stitch transform maps current -> previous frame.
+            if not valid_h(H_stitch_rel, w, h): H_stitch_rel = None
+            disagreement = stitch_error(H_stitch_rel, np.eye(3), p_prev, p_curr)
+            if np.isfinite(disagreement) and disagreement > args.max_disagreement and H_tapir is not None:
+                H_stitch_rel = None
+            H_rel, source = refine_h(H_stitch_rel, H_tapir, p_prev, p_curr, w, h, args.stitch_weight)
+            if canvas is None:
+                canvas, coverage, H_canvas = canvas_init(w, h, args.canvas_scale)
+                source = 'initialize'
+            elif valid_h(H_rel, w, h):
+                candidate = normalize_h(H_canvas @ H_rel)
+                if valid_h(candidate, w, h): H_canvas = candidate
+                else: source = 'hold_invalid'
+            else:
+                source = 'hold_no_motion'
+            compose(canvas, coverage, frame, H_canvas, mask)
+            if preview is None and not args.no_preview:
+                preview = AlignmentVideo(out / 'alignment_preview.mp4', fps / max(args.stride,1), args.preview_width, args.preview_height, args.preview_every)
+            if preview is not None:
+                if args.canvas_view == 'stitch' and stitch.canvas is not None:
+                    preview.write(rgb, stitch.canvas, H_stitch_abs, frame.shape, i,
+                                  f'Stitch renderer | fusion={source} | tracks={ntracks}',
+                                  coverage=getattr(stitch, 'canvas_mask', None))
+                else:
+                    preview.write(rgb, canvas, H_canvas, frame.shape, i,
+                                  f'Fused renderer | {source} | tracks={ntracks}', coverage=coverage)
+            if H_stitch_abs is not None: H_stitch_prev = H_stitch_abs
+            rows.append(dict(frame=i, seconds=time.perf_counter()-t0, source=source,
+                             tapir_tracks=ntracks, tapir_inliers=inliers,
+                             tapir_reprojection_px=tapir_error, stitch_tapir_disagreement_px=disagreement,
+                             stitch_valid=int(H_stitch_abs is not None), coverage_pixels=int(np.count_nonzero(coverage)),
+                             h00=H_canvas[0,0],h01=H_canvas[0,1],h02=H_canvas[0,2],
+                             h10=H_canvas[1,0],h11=H_canvas[1,1],h12=H_canvas[1,2],
+                             h20=H_canvas[2,0],h21=H_canvas[2,1],h22=H_canvas[2,2]))
+            if args.save_every and len(rows) % args.save_every == 0:
+                chosen = image_numpy(stitch.canvas) if args.canvas_view == 'stitch' and stitch.canvas is not None else canvas
+                save_rgb(out / f'panorama_{i:06d}.png', chosen)
+            progress.set_postfix(source=source, tracks=ntracks, refresh=False)
+            progress.update(1)
+    if preview is not None: preview.close()
+    if canvas is not None:
+        save_rgb(out / 'panorama_fused_final.png', canvas)
+        if stitch.canvas is not None:
+            save_rgb(out / 'panorama_stitch_final.png', image_numpy(stitch.canvas))
+        chosen = image_numpy(stitch.canvas) if args.canvas_view == 'stitch' and stitch.canvas is not None else canvas
+        save_rgb(out / 'panorama_final.png', chosen)
+        cv2.imwrite(str(out / 'coverage.png'), coverage)
+    write_metrics(out / 'metrics.csv', rows)
+    print('Saved', out)
 
-    summary = {
-        "frames": frame_idx,
-        "tapir_enabled": bool(args.enable_tapir),
-        "tapir_avg_ms": (tapir_total_ms / n_tapir_frames) if n_tapir_frames else 0.0,
-        "tapir_frames": n_tapir_frames,
-        "masking": mask_info,
-        "preview": str(preview.path),
-    }
-    print("[done]", summary)
-    (out_dir / "run_summary.json").write_text(
-        __import__("json").dumps(summary, indent=2))
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__': main()

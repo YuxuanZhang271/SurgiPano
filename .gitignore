@@ -1,1 +1,45 @@
-data/
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Distribution / packaging
+build/
+dist/
+wheels/
+*.egg-info/
+*.egg
+
+# Generated outputs (panoramas, metrics, previews)
+outputs/
+test_outputs/
+*.mp4
+*.png
+*.jpg
+*.jpeg
+
+# Model weights (fetched via scripts/fetch_weights.py)
+surgipano/weights/
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.engine
+*.safetensors
+
+# Logs / caches
+*.log
+.cache/
+.pytest_cache/
+.ipynb_checkpoints/
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
