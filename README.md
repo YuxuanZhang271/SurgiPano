@@ -5,45 +5,47 @@ Surgical and endoscopic video panorama stitching built on
 [TAPIR](https://github.com/google-deepmind/tapnet) causal point tracking for
 geometric refinement.
 
-This repository contains an experiment harness with three scripts:
+This repository contains an experiment harness with three pipelines:
 
 | Script | Purpose |
 |---|---|
 | `surgipano/run_stitch.py` | Stitch baseline — native Stitch-seg canvas |
-| `surgipano/run_integrated.py` | Continuous TAPIR + Stitch geometric fusion |
-| `surgipano/evaluate.py` | Metrics comparison (baseline vs. integrated) |
+| `surgipano/run_tapir_stitch.py` | Persistent TAPIR + Stitch global geometric fusion |
+| `surgipano/run_emdq_tapir_stitch.py` | Persistent TAPIR + Stitch with local nonrigid residual warp |
+| `surgipano/evaluate.py` | Metrics comparison across all three pipelines |
 
 ## What it does
 
 - **Alignment (primary):** Stitch-seg's ALIKED + LightGlue homography.
-- **Alignment (refinement):** causal TAPIR tracking of a fixed query grid,
+- **Alignment (refinement):** causal TAPIR tracking with persistent point IDs and adaptive query replenishment,
   used to validate the Stitch transform and to robustly refine it against a
   soft Stitch prior.
 - **Masking:** an optional scope mask (white = valid endoscope region) is
   cropped to the Stitch ROI and injected into the stitcher, and is also used
   to reject TAPIR queries that fall outside the visible scope.
 - **Benchmarking:** `evaluate.py` compares runtime, TAPIR self-consistency,
-  and output metadata between the two pipelines.
+  and output metadata across the three pipelines.
 
 ## Design
 
-The two pipelines are strictly independent branches:
+The three pipelines are independent experimental branches:
 
 | Branch | Component | Toggle |
 |---|---|---|
 | Alignment | Stitch-seg homography | always on |
-| Alignment refinement | TAPIR causal tracker | `--tapir-checkpoint` (required for integrated) |
+| Alignment refinement | TAPIR causal tracker | `--tapir-checkpoint` (required for TAPIR pipelines) |
+| Local deformation | Robust spatially smoothed residual field | EMDQ-inspired pipeline only |
 | Masking | Scope mask | `--scope-mask` |
 
 TAPIR never replaces the homography outright and never participates in
-Stitch's internal matcher. The integrated pipeline composes its **own**
+Stitch's internal matcher. The TAPIR pipelines compose their **own**
 independent panorama outside `StitchInferencer`, using a transform selected
 and refined from Stitch's candidate plus TAPIR correspondences. This keeps
 failure modes separable and makes benchmark attribution clean.
 
 ### Motion source selection
 
-Each frame in the integrated pipeline records a `source` in `metrics.csv`:
+Each frame in the TAPIR pipelines records a `source` in `metrics.csv`:
 
 | `source` | Meaning |
 |---|---|
@@ -116,13 +118,13 @@ python surgipano/run_stitch.py \
   --max-frames 300
 ```
 
-### Integrated (TAPIR + Stitch)
+### TAPIR + Stitch (persistent global fusion)
 
 ```bash
-python surgipano/run_integrated.py \
+python surgipano/run_tapir_stitch.py \
   --video ../../Datasets/002_S8a_videos_480p/S01_10_00.mp4 \
   --scope-mask ../../Datasets/002_S8a_videos_480p/S01_mask.png \
-  --output-dir outputs/integrated \
+  --output-dir outputs/tapir_stitch \
   --aliked-weights third_party/Stitch-seg/weights/aliked-n16.pth \
   --lightglue-weights third_party/Stitch-seg/weights/aliked_lightglue_v0-1_arxiv.pth \
   --tapir-checkpoint third_party/tapnet/checkpoints/causal_bootstapir_checkpoint.pt \
@@ -131,16 +133,39 @@ python surgipano/run_integrated.py \
   --max-frames 300
 ```
 
+### EMDQ-inspired TAPIR + Stitch (global + local nonrigid fusion)
+
+```bash
+python surgipano/run_emdq_tapir_stitch.py \
+  --video ../../Datasets/002_S8a_videos_480p/S01_10_00.mp4 \
+  --scope-mask ../../Datasets/002_S8a_videos_480p/S01_mask.png \
+  --output-dir outputs/emdq_tapir_stitch \
+  --aliked-weights third_party/Stitch-seg/weights/aliked-n16.pth \
+  --lightglue-weights third_party/Stitch-seg/weights/aliked_lightglue_v0-1_arxiv.pth \
+  --tapir-checkpoint third_party/tapnet/checkpoints/causal_bootstapir_checkpoint.pt \
+  --deform-sigma 65 --deform-max-px 20 --deform-grid-step 8 \
+  --preview-width 1600 --preview-height 720 \
+  --canvas-view fused --max-frames 300
+```
+
+This experimental branch uses `W_t(p) = pi(H_t p) + D_t(p)`, where
+`pi` normalizes homogeneous coordinates and `D_t` is a robustly weighted,
+spatially smoothed 2D residual field estimated from TAPIR tracks. It is
+**EMDQ-inspired**, not a full reproduction of the paper's EM/dual-quaternion
+algorithm, loop closure, or nonrigid SLAM.
+
 ### Evaluation
 
 ```bash
-python surgipano/evaluate.py --baseline outputs/stitch --integrated outputs/integrated \
+python surgipano/evaluate.py --baseline outputs/stitch \
+  --tapir-stitch outputs/tapir_stitch \
+  --emdq-tapir-stitch outputs/emdq_tapir_stitch \
   --output outputs/evaluation.json
 ```
 
 ### Common options
 
-Options shared by both pipelines (defined in `surgipano/common.py`):
+Options shared by all pipelines (defined in `surgipano/common.py`):
 
 | Option | Default | Description |
 |---|---|---|
@@ -156,21 +181,28 @@ Options shared by both pipelines (defined in `surgipano/common.py`):
 | `--canvas-scale` | `3` | Canvas size multiplier |
 | `--save-every` | `100` | Save a panorama every N frames |
 
-Integrated-only options:
+TAPIR pipeline options:
 
 | Option | Default | Description |
 |---|---|---|
 | `--tapir-checkpoint` | *required* | Causal TAPIR checkpoint |
 | `--tapir-resolution` | `256` | Tracker input resolution |
 | `--tapir-spacing` | `48` | Query grid spacing in pixels |
-| `--tapir-refresh` | `30` | Frames between tracker re-initialization |
+| `--tapir-max-points` | `192` | Maximum active/occluded point identities |
+| `--tapir-replenish-every` | `5` | Minimum processed frames between replenishment checks |
+| `--tapir-max-missing` | `90` | Consecutive missing frames before retiring a track |
+| `--tapir-min-confidence` | `0.5` | Minimum point visibility/confidence |
 | `--ransac-threshold` | `3.0` | RANSAC threshold (pixels) for TAPIR homography |
 | `--stitch-weight` | `0.25` | Weight of the soft Stitch prior during refinement |
 | `--max-disagreement` | `25.0` | Discard the Stitch transform above this disagreement (px) |
 | `--canvas-view` | `stitch` | Which panorama to render: `stitch` or `fused` |
 
-Both pipelines accept `--mask-margin`, `--preview-width`, `--preview-height`,
+All pipelines accept `--mask-margin`, `--preview-width`, `--preview-height`,
 `--preview-every`, and `--no-preview`.
+
+EMDQ-inspired pipeline options include `--deform-sigma` (spatial smoothing),
+`--deform-max-px` (residual displacement cap), and `--deform-grid-step`
+(dense warp sampling resolution).
 
 ### Outputs
 
@@ -182,9 +214,9 @@ Each run writes to its `--output-dir`:
 | `panorama_final.png` | Final panorama (`--canvas-view` selected) |
 | `panorama_<frame>.png` | Periodic panorama snapshots |
 | `alignment_preview.mp4` | Side-by-side source frame and panorama |
-| `coverage.png` | Canvas coverage mask (integrated only) |
+| `coverage.png` | Canvas coverage mask (TAPIR pipelines only) |
 
-The integrated run additionally writes `panorama_fused_final.png` and
+The TAPIR runs additionally write `panorama_fused_final.png` and
 `panorama_stitch_final.png`, giving both renderings side by side regardless
 of `--canvas-view`.
 
@@ -207,16 +239,16 @@ of `--canvas-view`.
 - The baseline follows the upstream demo's missing-tool-detector behavior
   (zero masks) but **does** inject the scope mask when `--scope-mask` is
   given, so masking behaviour is comparable across both pipelines.
-- The integrated output is a demonstration of **prior + robust geometric
+- The TAPIR outputs are demonstrations of **prior + robust geometric
   refinement**, not a trained model or a joint neural fusion network.
 - Canvas images are RGB converted to BGR on disk. The baseline uses Stitch's
-  own canvas, while the integrated pipeline uses a separately constructed
+  own canvas, while the TAPIR pipelines use a separately constructed
   canvas; their coverage should not be compared as an accuracy metric.
 - `evaluate.py` can compare runtime, TAPIR internal reprojection, and output
   metadata. **It cannot establish improved registration accuracy without
   independent landmark/camera-pose ground truth.** Ground truth is optional
   and needs a CSV with `frame,query_x,query_y,x,y`, where `x,y` is the
-  landmark in the integrated canvas coordinate system and `query_x,query_y`
+  landmark in the corresponding TAPIR canvas coordinate system and `query_x,query_y`
   is the same point in the current cropped frame.
 - For endoscopy, rigid homographies may fail under parallax, tissue
   deformation, forward camera translation, occlusion, and specular
@@ -242,7 +274,10 @@ of `--canvas-view`.
         fetch_weights.py        # downloads TAPIR / ALIKED / LightGlue weights
       surgipano/
         run_stitch.py           # Stitch baseline
-        run_integrated.py       # TAPIR + Stitch geometric fusion
+        run_tapir_stitch.py     # persistent TAPIR + Stitch global fusion
+        run_emdq_tapir_stitch.py # global + local nonrigid fusion
+        pipeline.py             # shared TAPIR pipeline
+        nonrigid.py             # local residual field and warp
         evaluate.py             # metrics comparison
         common.py               # shared args, homography helpers, canvas ops
         tapir_adapter.py        # causal BootsTAPIR wrapper
